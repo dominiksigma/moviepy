@@ -8,11 +8,7 @@ import warnings
 import numpy as np
 
 from moviepy.config import FFMPEG_BINARY  # ffmpeg, ffmpeg.exe, etc...
-from moviepy.tools import (
-    convert_to_seconds,
-    cross_platform_popen_params,
-    ffmpeg_escape_filename,
-)
+from moviepy.tools import convert_to_seconds, cross_platform_popen_params
 
 
 class FFMPEG_VideoReader:
@@ -39,10 +35,8 @@ class FFMPEG_VideoReader:
             decode_file=decode_file,
             print_infos=print_infos,
         )
-        # If framerate is unavailable, assume 1.0 FPS to avoid divide-by-zero errors.
-        self.fps = infos.get("video_fps", 1.0)
-        # If frame size is unavailable, set 1x1 divide-by-zero errors.
-        self.size = infos.get("video_size", (1, 1))
+        self.fps = infos["video_fps"]
+        self.size = infos["video_size"]
 
         # ffmpeg automatically rotates videos if rotation information is
         # available, so exchange width and height
@@ -61,10 +55,10 @@ class FFMPEG_VideoReader:
                 self.size = target_resolution
         self.resize_algo = resize_algo
 
-        self.duration = infos.get("video_duration", 0.0)
-        self.ffmpeg_duration = infos.get("duration", 0.0)
-        self.n_frames = infos.get("video_n_frames", 0)
-        self.bitrate = infos.get("video_bitrate", 0)
+        self.duration = infos["video_duration"]
+        self.ffmpeg_duration = infos["duration"]
+        self.n_frames = infos["video_n_frames"]
+        self.bitrate = infos["video_bitrate"]
 
         self.infos = infos
 
@@ -87,7 +81,28 @@ class FFMPEG_VideoReader:
         Sets self.pos to the appropriate value (1 if start_time == 0 because
         it pre-reads the first frame).
         """
-        self.close(delete_lastread=False)  # if any
+        self.close(delete_last_read=False)  # if any
+
+        # self.pos represents the (0-indexed) index of the frame that is next in line
+        # to be read by self.read_frame().
+        # Eg when self.pos is 1, the 2nd frame will be read next.
+        self.pos = self.get_frame_number(start_time)
+
+        # Getting around a difference between ffmpeg and moviepy seeking:
+        # "moviepy seek" means "get the frame displayed at time t"
+        #   Hence given a 29.97 FPS video, seeking to .01s means "get frame 0".
+        # "ffmpeg seek" means "skip all frames until you reach time t".
+        #   This time, seeking to .01s means "get frame 1". Surprise!
+        #
+        # (In 30fps, timestamps like 2.0s, 3.5s will give the same frame output
+        # under both rules, for the timestamp can be represented exactly in
+        # decimal.)
+        #
+        # So we'll subtract an epsilon from the timestamp given to ffmpeg.
+        if self.pos != 0:
+            start_time = self.pos * (1 / self.fps) - 0.00001
+        else:
+            start_time = 0.0
 
         if start_time != 0:
             offset = min(1, start_time)
@@ -95,24 +110,12 @@ class FFMPEG_VideoReader:
                 "-ss",
                 "%.06f" % (start_time - offset),
                 "-i",
-                ffmpeg_escape_filename(self.filename),
+                self.filename,
                 "-ss",
                 "%.06f" % offset,
             ]
         else:
-            i_arg = ["-i", ffmpeg_escape_filename(self.filename)]
-
-        # For webm video (vp8 and vp9) with transparent layer, force libvpx/libvpx-vp9
-        # as ffmpeg native webm decoder dont decode alpha layer
-        # (see
-        # https://www.reddit.com/r/ffmpeg/comments/fgpyfb/help_with_webm_with_alpha_channel/
-        # )
-        if self.depth == 4:
-            codec_name = self.infos.get("video_codec_name")
-            if codec_name == "vp9":
-                i_arg = ["-c:v", "libvpx-vp9"] + i_arg
-            elif codec_name == "vp8":
-                i_arg = ["-c:v", "libvpx"] + i_arg
+            i_arg = ["-i", self.filename]
 
         cmd = (
             [FFMPEG_BINARY]
@@ -133,7 +136,6 @@ class FFMPEG_VideoReader:
                 "-",
             ]
         )
-
         popen_params = cross_platform_popen_params(
             {
                 "bufsize": self.bufsize,
@@ -143,11 +145,6 @@ class FFMPEG_VideoReader:
             }
         )
         self.proc = sp.Popen(cmd, **popen_params)
-
-        # self.pos represents the (0-indexed) index of the frame that is next in line
-        # to be read by self.read_frame().
-        # Eg when self.pos is 1, the 2nd frame will be read next.
-        self.pos = self.get_frame_number(start_time)
         self.last_read = self.read_frame()
 
     def skip_frames(self, n=1):
@@ -245,11 +242,6 @@ class FFMPEG_VideoReader:
             result = self.read_frame()
             return result
 
-    @property
-    def lastread(self):
-        """Alias of `self.last_read` for backwards compatibility with MoviePy 1.x."""
-        return self.last_read
-
     def get_frame_number(self, t):
         """Helper method to return the frame number at time ``t``"""
         # I used this horrible '+0.00001' hack because sometimes due to numerical
@@ -258,7 +250,14 @@ class FFMPEG_VideoReader:
         # are getting the nth frame by writing get_frame(n/fps).
         return int(self.fps * t + 0.00001)
 
-    def close(self, delete_lastread=True):
+    @property
+    def lastread(self):
+        """Support old name of the "last_read" attribute, which may be used
+        by existing libraries, such as scenedetect.
+        """
+        return self.last_read
+
+    def close(self, delete_last_read=True):
         """Closes the reader terminating the process, if is still open."""
         if self.proc:
             if self.proc.poll() is None:
@@ -267,7 +266,7 @@ class FFMPEG_VideoReader:
                 self.proc.stderr.close()
                 self.proc.wait()
             self.proc = None
-        if delete_lastread and hasattr(self, "last_read"):
+        if delete_last_read and hasattr(self, "last_read"):
             del self.last_read
 
     def __del__(self):
@@ -418,7 +417,7 @@ class FFmpegInfosParser:
                     self.result["duration"] = self.parse_duration(line)
 
                 # parse global bitrate (in kb/s)
-                bitrate_match = re.search(r"bitrate: (\d+) k(i?)b/s", line)
+                bitrate_match = re.search(r"bitrate: (\d+) kb/s", line)
                 self.result["bitrate"] = (
                     int(bitrate_match.group(1)) if bitrate_match else None
                 )
@@ -528,10 +527,7 @@ class FFmpegInfosParser:
 
                 if self._current_stream["stream_type"] == "video":
                     field, value = self.video_metadata_type_casting(field, value)
-                    # ffmpeg 7 now use displaymatrix instead of rotate
                     if field == "rotate":
-                        self.result["video_rotation"] = value
-                    elif field == "displaymatrix":
                         self.result["video_rotation"] = value
 
                 # multiline metadata value parsing
@@ -583,11 +579,8 @@ class FFmpegInfosParser:
         # last input file, must be included in self.result
         if self._current_input_file:
             self._current_input_file["streams"].append(self._current_stream)
-            # include their chapters, if there are any
-            if (
-                "input_number" in self._current_input_file
-                and len(input_chapters) == self._current_input_file["input_number"] + 1
-            ):
+            # include their chapters, if there are
+            if len(input_chapters) == self._current_input_file["input_number"] + 1:
                 self._current_input_file["chapters"] = input_chapters[
                     self._current_input_file["input_number"]
                 ]
@@ -595,13 +588,13 @@ class FFmpegInfosParser:
 
         # some video duration utilities
         if self.result["video_found"] and self.check_duration:
-            self.result["video_duration"] = self.result["duration"]
             self.result["video_n_frames"] = int(
-                self.result["duration"] * self.result.get("video_fps", 0)
+                self.result["duration"] * self.result["video_fps"]
             )
+            self.result["video_duration"] = self.result["duration"]
         else:
-            self.result["video_n_frames"] = 0
-            self.result["video_duration"] = 0.0
+            self.result["video_n_frames"] = 1
+            self.result["video_duration"] = None
         # We could have also recomputed duration from the number of frames, as follows:
         # >>> result['video_duration'] = result['video_n_frames'] / result['video_fps']
 
@@ -647,7 +640,7 @@ class FFmpegInfosParser:
             # AttributeError: 'NoneType' object has no attribute 'group'
             # ValueError: invalid literal for int() with base 10: '<string>'
             stream_data["fps"] = "unknown"
-        match_audio_bitrate = re.search(r"(\d+) k(i?)b/s", line)
+        match_audio_bitrate = re.search(r"(\d+) kb/s", line)
         stream_data["bitrate"] = (
             int(match_audio_bitrate.group(1)) if match_audio_bitrate else None
         )
@@ -675,7 +668,7 @@ class FFmpegInfosParser:
                 % (self.filename, self.infos)
             )
 
-        match_bitrate = re.search(r"(\d+) k(i?)b/s", line)
+        match_bitrate = re.search(r"(\d+) kb/s", line)
         stream_data["bitrate"] = int(match_bitrate.group(1)) if match_bitrate else None
 
         # Get the frame rate. Sometimes it's 'tbr', sometimes 'fps', sometimes
@@ -709,22 +702,6 @@ class FFmpegInfosParser:
             if (fps != x) and abs(fps - x * coef) < 0.01:
                 fps = x * coef
         stream_data["fps"] = fps
-
-        # Try to extract video codec and profile
-        main_info_match = re.search(
-            r"Video:\s(\w+)?\s?(\([^)]+\))?",
-            line.lstrip(),
-        )
-        if main_info_match is not None:
-            (codec_name, profile) = main_info_match.groups()
-            stream_data["codec_name"] = codec_name
-            stream_data["profile"] = profile
-
-        if self._current_stream["default"] or "video_codec_name" not in self.result:
-            global_data["video_codec_name"] = stream_data.get("codec_name", None)
-
-        if self._current_stream["default"] or "video_profile" not in self.result:
-            global_data["video_profile"] = stream_data.get("profile", None)
 
         if self._current_stream["default"] or "video_size" not in self.result:
             global_data["video_size"] = stream_data.get("size", None)
@@ -777,25 +754,13 @@ class FFmpegInfosParser:
         """Returns a tuple with a metadata field-value pair given a ffmpeg `-i`
         command output line.
         """
-        info = line.split(":", 1)
-        if len(info) == 2:
-            raw_field, raw_value = info
-            return (raw_field.strip(" "), raw_value.strip(" "))
-        else:
-            return ("", "")
+        raw_field, raw_value = line.split(":", 1)
+        return (raw_field.strip(" "), raw_value.strip(" "))
 
     def video_metadata_type_casting(self, field, value):
         """Cast needed video metadata fields to other types than the default str."""
         if field == "rotate":
             return (field, float(value))
-
-        elif field == "displaymatrix":
-            match = re.search(r"[-+]?\d+(\.\d+)?", value)
-            if match:
-                # We must multiply by -1 because displaymatrix return info
-                # about how to rotate to show video, not about video rotation
-                return (field, float(match.group()) * -1)
-
         return (field, value)
 
 
@@ -823,8 +788,6 @@ def ffmpeg_parse_infos(
     - ``"audio_fps"``
     - ``"audio_bitrate"``
     - ``"audio_metadata"``
-    - ``"video_codec_name"``
-    - ``"video_profile"``
 
     Note that "video_duration" is slightly smaller than "duration" to avoid
     fetching the incomplete frames at the end, which raises an error.
@@ -851,7 +814,7 @@ def ffmpeg_parse_infos(
       https://github.com/Zulko/moviepy/pull/1222).
     """
     # Open the file in a pipe, read output
-    cmd = [FFMPEG_BINARY, "-hide_banner", "-i", ffmpeg_escape_filename(filename)]
+    cmd = [FFMPEG_BINARY, "-hide_banner", "-i", filename]
     if decode_file:
         cmd.extend(["-f", "null", "-"])
 
